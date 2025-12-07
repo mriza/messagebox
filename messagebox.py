@@ -7,6 +7,9 @@ from tkinter import scrolledtext, messagebox
 
 import paho.mqtt.client as mqtt
 import pika
+import json
+import os
+from tkinter import simpledialog
 
 class ProtocolType:
     MQTT = "MQTT"
@@ -97,18 +100,61 @@ class AmqpClientWrapper:
         if self.connection and self.connection.is_open:
             self.connection.close()
 
+
+class ProfileManager:
+    def __init__(self, filepath="profiles.json"):
+        self.filepath = filepath
+        self.profiles = self.load_all()
+
+    def load_all(self):
+        if not os.path.exists(self.filepath):
+            return {}
+        try:
+            with open(self.filepath, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save(self, name, data):
+        self.profiles[name] = data
+        self._write_file()
+
+    def delete(self, name):
+        if name in self.profiles:
+            del self.profiles[name]
+            self._write_file()
+
+    def _write_file(self):
+        with open(self.filepath, "w") as f:
+            json.dump(self.profiles, f, indent=4)
+
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("MQTT & AMQP Tester")
+        self.profile_manager = ProfileManager()
         self.msg_queue = queue.Queue()
         self.current_protocol = tk.StringVar(value=ProtocolType.MQTT)
         self.mqtt_client = MqttClientWrapper(self.enqueue_message)
         self.amqp_client = AmqpClientWrapper(self.enqueue_message)
         self.connected = False
+        self._build_profile_gui()
         self._build_gui()
         self._set_sender_receiver_state("disabled")
         self.root.after(100, self._process_queue)
+
+    def _build_profile_gui(self):
+        frame = ttk.Labelframe(self.root, text="Profiles", padding=10)
+        frame.pack(fill="x", padx=10, pady=(10, 0))
+
+        self.combo_profiles = ttk.Combobox(frame, state="readonly", width=30)
+        self.combo_profiles.pack(side="left", padx=5)
+        
+        ttk.Button(frame, text="Load", command=self.on_load_profile).pack(side="left", padx=2)
+        ttk.Button(frame, text="Save", command=self.on_save_profile).pack(side="left", padx=2)
+        ttk.Button(frame, text="Delete", bootstyle=DANGER, command=self.on_delete_profile).pack(side="left", padx=2)
+
+        self.refresh_profile_list()
 
     def _build_gui(self):
         top_frame = ttk.Labelframe(self.root, text="Connection Settings", padding=10)
@@ -328,6 +374,78 @@ class App:
         except queue.Empty:
             pass
         self.root.after(100, self._process_queue)
+
+    def refresh_profile_list(self):
+        profiles = list(self.profile_manager.profiles.keys())
+        self.combo_profiles["values"] = profiles
+        if profiles:
+            self.combo_profiles.current(0)
+        else:
+            self.combo_profiles.set("")
+
+    def get_current_settings(self):
+        return {
+            "protocol": self.current_protocol.get(),
+            "host": self.entry_host.get(),
+            "port": self.entry_port.get(),
+            "username": self.entry_user.get(),
+            "password": self.entry_pass.get(),
+            "mqtt_topic": self.entry_topic.get(),
+            "amqp_vhost": self.entry_vhost.get(),
+            "amqp_queue": self.entry_queue.get(),
+            "amqp_exchange": self.entry_exchange.get(),
+            "amqp_routing": self.entry_routing.get(),
+        }
+
+    def apply_settings(self, settings):
+        self.current_protocol.set(settings.get("protocol", ProtocolType.MQTT))
+        self.entry_host.delete(0, tk.END)
+        self.entry_host.insert(0, settings.get("host", ""))
+        self.entry_port.delete(0, tk.END)
+        self.entry_port.insert(0, settings.get("port", ""))
+        self.entry_user.delete(0, tk.END)
+        self.entry_user.insert(0, settings.get("username", ""))
+        self.entry_pass.delete(0, tk.END)
+        self.entry_pass.insert(0, settings.get("password", ""))
+
+        self.entry_topic.delete(0, tk.END)
+        self.entry_topic.insert(0, settings.get("mqtt_topic", ""))
+
+        self.entry_vhost.delete(0, tk.END)
+        self.entry_vhost.insert(0, settings.get("amqp_vhost", ""))
+        self.entry_queue.delete(0, tk.END)
+        self.entry_queue.insert(0, settings.get("amqp_queue", ""))
+        self.entry_exchange.delete(0, tk.END)
+        self.entry_exchange.insert(0, settings.get("amqp_exchange", ""))
+        self.entry_routing.delete(0, tk.END)
+        self.entry_routing.insert(0, settings.get("amqp_routing", ""))
+        
+        # Trigger protocol change to update UI state
+        self._on_protocol_change()
+
+    def on_save_profile(self):
+        name = simpledialog.askstring("Save Profile", "Enter profile name:")
+        if name:
+            settings = self.get_current_settings()
+            self.profile_manager.save(name, settings)
+            self.refresh_profile_list()
+            self.combo_profiles.set(name)
+
+    def on_load_profile(self):
+        name = self.combo_profiles.get()
+        if not name:
+            return
+        if name in self.profile_manager.profiles:
+            settings = self.profile_manager.profiles[name]
+            self.apply_settings(settings)
+
+    def on_delete_profile(self):
+        name = self.combo_profiles.get()
+        if not name:
+            return
+        if messagebox.askyesno("Confirm", f"Delete property '{name}'?"):
+            self.profile_manager.delete(name)
+            self.refresh_profile_list()
 
 def main():
     app = ttk.Window(themename="flatly")
