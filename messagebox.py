@@ -1,25 +1,30 @@
+import sys
 import threading
-import queue
-import tkinter as tk
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
-from tkinter import scrolledtext, messagebox
-
+import os
+import json
 import paho.mqtt.client as mqtt
 import pika
-import json
-import os
-from tkinter import simpledialog
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QFormLayout, QComboBox, QLineEdit, 
+                             QPushButton, QLabel, QCheckBox, QTextEdit, 
+                             QGroupBox, QStackedWidget, QMessageBox, QInputDialog)
+from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, pyqtSlot
 
 class ProtocolType:
     MQTT = "MQTT"
     AMQP = "AMQP"
 
+class Signaller(QObject):
+    log_message = pyqtSignal(str)
+
 class MqttClientWrapper:
-    def __init__(self, on_message_callback):
+    def __init__(self, callback):
         self.client = None
-        self.on_message_callback = on_message_callback
+        self.callback = callback
         self.connected = False
+        self.topic = None
 
     def connect(self, host, port, username=None, password=None, topic=None):
         self.client = mqtt.Client()
@@ -35,13 +40,18 @@ class MqttClientWrapper:
         self.connected = (rc == 0)
         if self.connected and self.topic:
             self.client.subscribe(self.topic)
+
     def _on_message(self, client, userdata, msg):
-        payload = msg.payload.decode("utf-8", errors="ignore")
-        self.on_message_callback(f"[MQTT] {msg.topic}: {payload}")
+        try:
+            payload = msg.payload.decode("utf-8", errors="ignore")
+            self.callback(f"[MQTT] {msg.topic}: {payload}")
+        except Exception:
+            pass
 
     def publish(self, topic, payload):
         if self.client and self.connected:
             self.client.publish(topic, payload)
+
     def disconnect(self):
         if self.client:
             self.client.loop_stop()
@@ -49,12 +59,14 @@ class MqttClientWrapper:
             self.connected = False
 
 class AmqpClientWrapper:
-    def __init__(self, on_message_callback):
+    def __init__(self, callback):
         self.connection = None
         self.channel = None
-        self.on_message_callback = on_message_callback
+        self.callback = callback
         self.consume_thread = None
         self._stop_event = threading.Event()
+        self.queue_name = None
+
     def connect(self, host, port, vhost, username, password, queue_name):
         credentials = pika.PlainCredentials(username, password) if username else None
         params = pika.ConnectionParameters(
@@ -67,25 +79,34 @@ class AmqpClientWrapper:
         self.channel = self.connection.channel()
         self.queue_name = queue_name
         self.channel.queue_declare(queue=queue_name, durable=False)
+
     def start_consume(self):
         if not self.channel:
             return
 
         self._stop_event.clear()
         def _consume():
-            for method_frame, properties, body in self.channel.consume(self.queue_name, inactivity_timeout=1):
-                if self._stop_event.is_set():
-                    break
-                if body is None:
-                    continue
-                payload = body.decode("utf-8", errors="ignore")
-                self.on_message_callback(f"[AMQP] {self.queue_name}: {payload}")
-                self.channel.basic_ack(method_frame.delivery_tag)
+            try:
+                for method_frame, properties, body in self.channel.consume(self.queue_name, inactivity_timeout=1):
+                    if self._stop_event.is_set():
+                        break
+                    if body is None:
+                        continue
+                    payload = body.decode("utf-8", errors="ignore")
+                    self.callback(f"[AMQP] {self.queue_name}: {payload}")
+                    self.channel.basic_ack(method_frame.delivery_tag)
+            except Exception as e:
+                # Provide some feedback if consumption fails
+                # In a real app, perhaps signal back to UI
+                pass
 
         self.consume_thread = threading.Thread(target=_consume, daemon=True)
         self.consume_thread.start()
+
     def stop_consume(self):
         self._stop_event.set()
+
+
     def publish(self, exchange, routing_key, payload):
         if self.channel:
             self.channel.basic_publish(
@@ -93,6 +114,7 @@ class AmqpClientWrapper:
                 routing_key=routing_key,
                 body=payload.encode("utf-8"),
             )
+
     def disconnect(self):
         self.stop_consume()
         if self.channel and self.channel.is_open:
@@ -100,358 +122,359 @@ class AmqpClientWrapper:
         if self.connection and self.connection.is_open:
             self.connection.close()
 
+# CSV Profile Manager adaptation
+# JSON + Base64 Profile Manager
+import base64
 
 class ProfileManager:
-    def __init__(self, filepath="profiles.json"):
+    def __init__(self, filepath="profiles.txt"):
         self.filepath = filepath
         self.profiles = self.load_all()
 
     def load_all(self):
+        data = {}
         if not os.path.exists(self.filepath):
-            return {}
+            return data
+        
         try:
             with open(self.filepath, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+                content = f.read().strip()
+                if not content: return data
+                # Fix padding if necessary
+                missing_padding = len(content) % 4
+                if missing_padding:
+                    content += '=' * (4 - missing_padding)
+                json_str = base64.b64decode(content).decode("utf-8")
+                data = json.loads(json_str)
+        except Exception as e:
+            print(f"Error loading profiles: {e}")
+            # If data is corrupt, return empty dict so app can start
+            data = {}
+        return data
+
+    def save_all(self):
+        try:
+            json_str = json.dumps(self.profiles)
+            encoded = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+            with open(self.filepath, "w") as f:
+                f.write(encoded)
+        except Exception as e:
+            print(f"Error saving profiles: {e}")
 
     def save(self, name, data):
+        data["name"] = name
         self.profiles[name] = data
-        self._write_file()
+        self.save_all()
 
     def delete(self, name):
         if name in self.profiles:
             del self.profiles[name]
-            self._write_file()
+            self.save_all()
 
-    def _write_file(self):
-        with open(self.filepath, "w") as f:
-            json.dump(self.profiles, f, indent=4)
+class MessageBoxApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MessageBox : An MQTT & AMQP Tester")
+        self.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "message.png")))
+        self.resize(800, 600)
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("MQTT & AMQP Tester")
+        self.signaller = Signaller()
+        self.signaller.log_message.connect(self.append_log)
+
         self.profile_manager = ProfileManager()
-        self.msg_queue = queue.Queue()
-        self.current_protocol = tk.StringVar(value=ProtocolType.MQTT)
-        self.mqtt_client = MqttClientWrapper(self.enqueue_message)
-        self.amqp_client = AmqpClientWrapper(self.enqueue_message)
+        self.mqtt_client = MqttClientWrapper(self.signaller.log_message.emit)
+        self.amqp_client = AmqpClientWrapper(self.signaller.log_message.emit)
         self.connected = False
-        self._build_profile_gui()
-        self._build_gui()
-        self._set_sender_receiver_state("disabled")
-        self.root.after(100, self._process_queue)
 
-    def _build_profile_gui(self):
-        frame = ttk.Labelframe(self.root, text="Profiles", padding=10)
-        frame.pack(fill="x", padx=10, pady=(10, 0))
+        self._init_ui()
 
-        self.combo_profiles = ttk.Combobox(frame, state="readonly", width=30)
-        self.combo_profiles.pack(side="left", padx=5)
+    def _init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # === Profiles ===
+        profile_group = QGroupBox("Profiles")
+        profile_layout = QHBoxLayout()
+        self.combo_profiles = QComboBox()
+        self.combo_profiles.setMinimumWidth(200)
+        btn_load = QPushButton("Load")
+        btn_load.clicked.connect(self.on_load_profile)
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self.on_save_profile)
+        btn_delete = QPushButton("Delete")
+        btn_delete.clicked.connect(self.on_delete_profile)
         
-        ttk.Button(frame, text="Load", command=self.on_load_profile).pack(side="left", padx=2)
-        ttk.Button(frame, text="Save", command=self.on_save_profile).pack(side="left", padx=2)
-        ttk.Button(frame, text="Delete", bootstyle=DANGER, command=self.on_delete_profile).pack(side="left", padx=2)
+        profile_layout.addWidget(self.combo_profiles)
+        profile_layout.addWidget(btn_load)
+        profile_layout.addWidget(btn_save)
+        profile_layout.addWidget(btn_delete)
+        profile_layout.addStretch()
+        profile_group.setLayout(profile_layout)
+        main_layout.addWidget(profile_group)
 
         self.refresh_profile_list()
 
-    def _build_gui(self):
-        top_frame = ttk.Labelframe(self.root, text="Connection Settings", padding=10)
-        top_frame.pack(fill="x", padx=10, pady=10)
+        # === Connection Settings ===
+        conn_group = QGroupBox("Connection Settings")
+        conn_layout = QFormLayout()
 
-        proto_label = ttk.Label(top_frame, text="Protocol:")
-        proto_label.grid(row=0, column=0, sticky="w")
-        proto_combo = ttk.Combobox(
-            top_frame,
-            values=[ProtocolType.MQTT, ProtocolType.AMQP],
-            textvariable=self.current_protocol,
-            state="readonly",
-            width=8,
-        )
-        proto_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.combo_protocol = QComboBox()
+        self.combo_protocol.addItems([ProtocolType.MQTT, ProtocolType.AMQP])
+        self.combo_protocol.currentTextChanged.connect(self._on_protocol_change)
+        conn_layout.addRow("Protocol:", self.combo_protocol)
 
-        ttk.Label(top_frame, text="Host:").grid(row=1, column=0, sticky="w")
-        self.entry_host = ttk.Entry(top_frame, width=25)
-        self.entry_host.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        self.entry_host.insert(0, "localhost")
+        hbox_host = QHBoxLayout()
+        self.entry_host = QLineEdit("localhost")
+        self.entry_port = QLineEdit("1883")
+        self.entry_port.setFixedWidth(80)
+        hbox_host.addWidget(self.entry_host)
+        hbox_host.addWidget(QLabel("Port:"))
+        hbox_host.addWidget(self.entry_port)
+        conn_layout.addRow("Host:", hbox_host)
 
-        ttk.Label(top_frame, text="Port:").grid(row=1, column=2, sticky="w")
-        self.entry_port = ttk.Entry(top_frame, width=6)
-        self.entry_port.grid(row=1, column=3, sticky="w", padx=5, pady=2)
-        self.entry_port.insert(0, "1883")  # default MQTT
+        hbox_auth = QHBoxLayout()
+        self.entry_user = QLineEdit()
+        self.entry_pass = QLineEdit()
+        self.entry_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        hbox_auth.addWidget(self.entry_user)
+        hbox_auth.addWidget(QLabel("Password:"))
+        hbox_auth.addWidget(self.entry_pass)
+        conn_layout.addRow("Username:", hbox_auth)
 
-        ttk.Label(top_frame, text="Username:").grid(row=2, column=0, sticky="w")
-        self.entry_user = ttk.Entry(top_frame, width=25)
-        self.entry_user.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-        ttk.Label(top_frame, text="Password:").grid(row=2, column=2, sticky="w")
-        self.entry_pass = ttk.Entry(top_frame, width=15, show="*")
-        self.entry_pass.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        # Stacked widgets for protocol specifics
+        self.stack_proto = QStackedWidget()
+        
+        # MQTT Page
+        self.page_mqtt = QWidget()
+        form_mqtt = QFormLayout()
+        self.entry_topic = QLineEdit("test/topic")
+        form_mqtt.addRow("MQTT Topic:", self.entry_topic)
+        self.page_mqtt.setLayout(form_mqtt)
+        self.stack_proto.addWidget(self.page_mqtt)
 
-        # Subframe hanya untuk MQTT
-        self.mqtt_frame = ttk.Frame(top_frame)
-        self.mqtt_frame.grid(row=3, column=0, columnspan=4, sticky="we", padx=2, pady=2)
-        ttk.Label(self.mqtt_frame, text="MQTT Topic:").grid(row=0, column=0, sticky="w")
-        self.entry_topic = ttk.Entry(self.mqtt_frame, width=30)
-        self.entry_topic.grid(row=0, column=1, sticky="w")
-        self.entry_topic.insert(0, "test/topic")
+        # AMQP Page
+        self.page_amqp = QWidget()
+        form_amqp = QFormLayout()
+        self.entry_vhost = QLineEdit("/")
+        self.entry_queue = QLineEdit("test_queue")
+        self.entry_exchange = QLineEdit("")
+        self.entry_routing = QLineEdit("test_queue")
+        
+        hbox_amqp_1 = QHBoxLayout()
+        hbox_amqp_1.addWidget(self.entry_vhost)
+        hbox_amqp_1.addWidget(QLabel("Queue:"))
+        hbox_amqp_1.addWidget(self.entry_queue)
+        
+        hbox_amqp_2 = QHBoxLayout()
+        hbox_amqp_2.addWidget(self.entry_exchange)
+        hbox_amqp_2.addWidget(QLabel("Routing Key:"))
+        hbox_amqp_2.addWidget(self.entry_routing)
 
-        # Subframe hanya untuk AMQP
-        self.amqp_frame = ttk.Frame(top_frame)
-        self.amqp_frame.grid(row=3, column=0, columnspan=4, sticky="we", padx=2, pady=2)
-        ttk.Label(self.amqp_frame, text="AMQP vhost:").grid(row=0, column=0, sticky="w")
-        self.entry_vhost = ttk.Entry(self.amqp_frame, width=10)
-        self.entry_vhost.grid(row=0, column=1, sticky="w")
-        self.entry_vhost.insert(0, "/")
-        ttk.Label(self.amqp_frame, text="Queue:").grid(row=0, column=2, sticky="w", padx=(10,0))
-        self.entry_queue = ttk.Entry(self.amqp_frame, width=13)
-        self.entry_queue.grid(row=0, column=3, sticky="w")
-        self.entry_queue.insert(0, "test_queue")
-        ttk.Label(self.amqp_frame, text="Exchange:").grid(row=1, column=0, sticky="w")
-        self.entry_exchange = ttk.Entry(self.amqp_frame, width=15)
-        self.entry_exchange.grid(row=1, column=1, sticky="w")
-        self.entry_exchange.insert(0, "")
-        ttk.Label(self.amqp_frame, text="Routing Key:").grid(row=1, column=2, sticky="w", padx=(10,0))
-        self.entry_routing = ttk.Entry(self.amqp_frame, width=13)
-        self.entry_routing.grid(row=1, column=3, sticky="w")
-        self.entry_routing.insert(0, "test_queue")
+        form_amqp.addRow("VHost:", hbox_amqp_1)
+        form_amqp.addRow("Exchange:", hbox_amqp_2)
+        self.page_amqp.setLayout(form_amqp)
+        self.stack_proto.addWidget(self.page_amqp)
 
-        self.btn_connect = ttk.Button(top_frame, text="Connect", bootstyle=SUCCESS, command=self.on_connect_clicked)
-        self.btn_connect.grid(row=0, column=3, sticky="e", padx=5)
+        conn_layout.addRow(self.stack_proto)
 
-        self.current_protocol.trace_add("write", self._on_protocol_change)
-        self._on_protocol_change()
+        hbox_connect = QHBoxLayout()
+        hbox_connect.addStretch()
+        self.btn_connect = QPushButton("Connect")
+        self.btn_connect.clicked.connect(self.on_connect_clicked)
+        hbox_connect.addWidget(self.btn_connect)
+        conn_layout.addRow(hbox_connect)
 
-        bottom_frame = ttk.Frame(self.root)
-        bottom_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        conn_group.setLayout(conn_layout)
+        main_layout.addWidget(conn_group)
 
-        sender_frame = ttk.Labelframe(bottom_frame, text="Sender", padding=10)
-        sender_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        # === Bottom Section (Sender & Receiver) ===
+        bottom_layout = QHBoxLayout()
+        
+        # === Sender ===
+        sender_group = QGroupBox("Sender")
+        sender_layout = QVBoxLayout()
+        self.chk_sender = QCheckBox("Enable Sender")
+        self.chk_sender.setChecked(True)
+        self.chk_sender.toggled.connect(self._update_ui_state)
+        sender_layout.addWidget(self.chk_sender)
 
-        self.var_enable_sender = tk.BooleanVar(value=True)
-        chk_sender = ttk.Checkbutton(sender_frame, text="Enable Sender", variable=self.var_enable_sender,
-                                     command=self._update_sender_state)
-        chk_sender.pack(anchor="w")
+        hbox_send = QHBoxLayout()
+        hbox_send.addWidget(QLabel("Payload:"))
+        self.entry_payload = QLineEdit()
+        self.btn_send = QPushButton("Send")
+        self.btn_send.clicked.connect(self.on_send_clicked)
+        hbox_send.addWidget(self.entry_payload)
+        hbox_send.addWidget(self.btn_send)
+        sender_layout.addLayout(hbox_send)
+        
+        self.txt_sent_log = QTextEdit()
+        self.txt_sent_log.setReadOnly(True)
+        sender_layout.addWidget(self.txt_sent_log)
+        
+        # sender_layout.addStretch() # Push content up
+        sender_group.setLayout(sender_layout)
+        
+        # === Receiver ===
+        receiver_group = QGroupBox("Receiver")
+        receiver_layout = QVBoxLayout()
+        self.chk_receiver = QCheckBox("Enable Receiver")
+        self.chk_receiver.setChecked(True)
+        self.chk_receiver.toggled.connect(self.on_receiver_toggled)
+        receiver_layout.addWidget(self.chk_receiver)
 
-        ttk.Label(sender_frame, text="Payload:").pack(anchor="w")
-        self.entry_payload = ttk.Entry(sender_frame)
-        self.entry_payload.pack(fill="x", pady=5)
+        self.txt_received_log = QTextEdit()
+        self.txt_received_log.setReadOnly(True)
+        receiver_layout.addWidget(self.txt_received_log)
+        receiver_group.setLayout(receiver_layout)
 
-        self.btn_send = ttk.Button(sender_frame, text="Send", command=self.on_send_clicked, bootstyle=PRIMARY)
-        self.btn_send.pack(anchor="e", pady=5)
+        bottom_layout.addWidget(sender_group, 1) # Stretch factor 1
+        bottom_layout.addWidget(receiver_group, 1) # Stretch factor 1
+        main_layout.addLayout(bottom_layout)
 
-        receiver_frame = ttk.Labelframe(bottom_frame, text="Receiver", padding=10)
-        receiver_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        self._update_ui_state()
 
-        self.var_enable_receiver = tk.BooleanVar(value=True)
-        chk_receiver = ttk.Checkbutton(receiver_frame, text="Enable Receiver", variable=self.var_enable_receiver,
-                                       command=self._update_receiver_state)
-        chk_receiver.pack(anchor="w")
-
-        ttk.Label(receiver_frame, text="Messages:").pack(anchor="w")
-        self.text_messages = scrolledtext.ScrolledText(receiver_frame, wrap="word", height=15)
-        self.text_messages.pack(fill="both", expand=True, pady=5)
-
-    def _on_protocol_change(self, *args):
-        proto = self.current_protocol.get()
-        if proto == ProtocolType.MQTT:
-            self.entry_port.delete(0, tk.END)
-            self.entry_port.insert(0, "1883")
-            self.mqtt_frame.grid()           # Tampilkan hanya frame MQTT
-            self.amqp_frame.grid_remove()    # Sembunyikan frame AMQP
+    def _on_protocol_change(self, text):
+        if text == ProtocolType.MQTT:
+            self.stack_proto.setCurrentWidget(self.page_mqtt)
+            if self.entry_port.text() in ["5672", ""]:
+                self.entry_port.setText("1883")
         else:
-            self.entry_port.delete(0, tk.END)
-            self.entry_port.insert(0, "5672")
-            self.amqp_frame.grid()           # Tampilkan hanya frame AMQP
-            self.mqtt_frame.grid_remove()    # Sembunyikan frame MQTT
+            self.stack_proto.setCurrentWidget(self.page_amqp)
+            if self.entry_port.text() in ["1883", ""]:
+                self.entry_port.setText("5672")
 
-    def _set_sender_receiver_state(self, state):
-        self.entry_payload.configure(state=state)
-        self.btn_send.configure(state=state)
-        self.text_messages.configure(state=state)
+    def _update_ui_state(self):
+        sender_enabled = self.connected and self.chk_sender.isChecked()
+        self.entry_payload.setEnabled(sender_enabled)
+        self.btn_send.setEnabled(sender_enabled)
+        
+        self.chk_sender.setEnabled(self.connected)
+        self.chk_receiver.setEnabled(self.connected)
 
-    def _update_sender_state(self):
-        if not self.connected:
-            self._set_sender_receiver_state("disabled")
-            return
-        if self.var_enable_sender.get():
-            self.entry_payload.configure(state="normal")
-            self.btn_send.configure(state="normal")
-        else:
-            self.entry_payload.configure(state="disabled")
-            self.btn_send.configure(state="disabled")
-
-    def _update_receiver_state(self):
-        if not self.connected:
-            self._set_sender_receiver_state("disabled")
-            return
-        if self.var_enable_receiver.get():
-            self.text_messages.configure(state="normal")
-            if self.current_protocol.get() == ProtocolType.AMQP:
+    def on_receiver_toggled(self):
+        if self.connected and self.combo_protocol.currentText() == ProtocolType.AMQP:
+            if self.chk_receiver.isChecked():
                 self.amqp_client.start_consume()
-        else:
-            if self.current_protocol.get() == ProtocolType.AMQP:
+            else:
                 self.amqp_client.stop_consume()
 
-    def on_connect_clicked(self):
-        if not self.connected:
-            self._do_connect()
+    @pyqtSlot(str)
+    def append_log(self, text):
+        if text.startswith("[SEND]") or "Published" in text:
+            self.txt_sent_log.append(text)
         else:
-            self._do_disconnect()
+            self.txt_received_log.append(text)
 
-    def _do_connect(self):
-        host = self.entry_host.get().strip()
-        port = self.entry_port.get().strip()
-        username = self.entry_user.get().strip() or None
-        password = self.entry_pass.get().strip() or None
-        proto = self.current_protocol.get()
+    def on_connect_clicked(self):
+        if self.connected:
+            self.disconnect()
+        else:
+            self.connect()
+
+    def connect(self):
+        host = self.entry_host.text()
+        port = self.entry_port.text()
+        user = self.entry_user.text()
+        pw = self.entry_pass.text()
+        proto = self.combo_protocol.currentText()
+
         try:
             if proto == ProtocolType.MQTT:
-                topic = self.entry_topic.get().strip()
-                self.mqtt_client.connect(host, port, username, password, topic)
+                topic = self.entry_topic.text()
+                self.mqtt_client.connect(host, port, user, pw, topic)
             else:
-                vhost = self.entry_vhost.get().strip()
-                queue_name = self.entry_queue.get().strip()
-                self.amqp_client.connect(host, port, vhost, username, password, queue_name)
+                vhost = self.entry_vhost.text()
+                queue = self.entry_queue.text()
+                self.amqp_client.connect(host, port, vhost, user, pw, queue)
+            
             self.connected = True
+            self.btn_connect.setText("Disconnect")
+            self._update_ui_state()
+            self.append_log(f"Connected to {proto}")
+
+            if self.chk_receiver.isChecked() and proto == ProtocolType.AMQP:
+                self.amqp_client.start_consume()
+
         except Exception as e:
-            messagebox.showerror("Connection error", str(e))
+            QMessageBox.critical(self, "Connection Error", str(e))
             self.connected = False
-            return
 
-        if self.connected:
-            self.btn_connect.configure(text="Disconnect", bootstyle=DANGER)
-            self._set_sender_receiver_state("normal")
-            self._update_sender_state()
-            self._update_receiver_state()
-            self.enqueue_message(f"Connected using {proto}")
-
-    def _do_disconnect(self):
-        proto = self.current_protocol.get()
+    def disconnect(self):
+        proto = self.combo_protocol.currentText()
         if proto == ProtocolType.MQTT:
             self.mqtt_client.disconnect()
         else:
             self.amqp_client.disconnect()
+        
         self.connected = False
-        self.btn_connect.configure(text="Connect", bootstyle=SUCCESS)
-        self._set_sender_receiver_state("disabled")
-        self.enqueue_message(f"Disconnected from {proto}")
+        self.btn_connect.setText("Connect")
+        self._update_ui_state()
+        self.append_log("Disconnected.")
 
     def on_send_clicked(self):
-        if not self.connected:
-            messagebox.showwarning("Not connected", "Please connect first.")
-            return
-        if not self.var_enable_sender.get():
-            return
-        payload = self.entry_payload.get()
-        if not payload:
-            messagebox.showwarning("Empty payload", "Please enter payload.")
-            return
-        proto = self.current_protocol.get()
-        try:
-            if proto == ProtocolType.MQTT:
-                topic = self.entry_topic.get().strip()
-                self.mqtt_client.publish(topic, payload)
-                self.enqueue_message(f"[MQTT-SENT] {topic}: {payload}")
-            else:
-                exchange = self.entry_exchange.get().strip()
-                routing_key = self.entry_routing.get().strip() or self.entry_queue.get().strip()
-                self.amqp_client.publish(exchange, routing_key, payload)
-                self.enqueue_message(f"[AMQP-SENT] {routing_key}: {payload}")
-        except Exception as e:
-            messagebox.showerror("Send error", str(e))
-
-    def enqueue_message(self, text):
-        self.msg_queue.put(text)
-
-    def _process_queue(self):
-        try:
-            while True:
-                msg = self.msg_queue.get_nowait()
-                self.text_messages.configure(state="normal")
-                self.text_messages.insert(tk.END, msg + "\n")
-                self.text_messages.see(tk.END)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._process_queue)
+        payload = self.entry_payload.text()
+        if not payload: return
+        
+        proto = self.combo_protocol.currentText()
+        if proto == ProtocolType.MQTT:
+            self.mqtt_client.publish(self.entry_topic.text(), payload)
+            self.append_log(f"[MQTT-SENT] {payload}")
+        else:
+            self.amqp_client.publish(self.entry_exchange.text(), self.entry_routing.text(), payload)
+            self.append_log(f"[AMQP-SENT] {payload}")
 
     def refresh_profile_list(self):
-        profiles = list(self.profile_manager.profiles.keys())
-        self.combo_profiles["values"] = profiles
-        if profiles:
-            self.combo_profiles.current(0)
-        else:
-            self.combo_profiles.set("")
-
-    def get_current_settings(self):
-        return {
-            "protocol": self.current_protocol.get(),
-            "host": self.entry_host.get(),
-            "port": self.entry_port.get(),
-            "username": self.entry_user.get(),
-            "password": self.entry_pass.get(),
-            "mqtt_topic": self.entry_topic.get(),
-            "amqp_vhost": self.entry_vhost.get(),
-            "amqp_queue": self.entry_queue.get(),
-            "amqp_exchange": self.entry_exchange.get(),
-            "amqp_routing": self.entry_routing.get(),
-        }
-
-    def apply_settings(self, settings):
-        self.current_protocol.set(settings.get("protocol", ProtocolType.MQTT))
-        self.entry_host.delete(0, tk.END)
-        self.entry_host.insert(0, settings.get("host", ""))
-        self.entry_port.delete(0, tk.END)
-        self.entry_port.insert(0, settings.get("port", ""))
-        self.entry_user.delete(0, tk.END)
-        self.entry_user.insert(0, settings.get("username", ""))
-        self.entry_pass.delete(0, tk.END)
-        self.entry_pass.insert(0, settings.get("password", ""))
-
-        self.entry_topic.delete(0, tk.END)
-        self.entry_topic.insert(0, settings.get("mqtt_topic", ""))
-
-        self.entry_vhost.delete(0, tk.END)
-        self.entry_vhost.insert(0, settings.get("amqp_vhost", ""))
-        self.entry_queue.delete(0, tk.END)
-        self.entry_queue.insert(0, settings.get("amqp_queue", ""))
-        self.entry_exchange.delete(0, tk.END)
-        self.entry_exchange.insert(0, settings.get("amqp_exchange", ""))
-        self.entry_routing.delete(0, tk.END)
-        self.entry_routing.insert(0, settings.get("amqp_routing", ""))
-        
-        # Trigger protocol change to update UI state
-        self._on_protocol_change()
+        self.combo_profiles.clear()
+        self.combo_profiles.addItems(list(self.profile_manager.profiles.keys()))
 
     def on_save_profile(self):
-        name = simpledialog.askstring("Save Profile", "Enter profile name:")
-        if name:
-            settings = self.get_current_settings()
-            self.profile_manager.save(name, settings)
+        name, ok = QInputDialog.getText(self, "Save Profile", "Enter profile name:")
+        if ok and name:
+            data = {
+                "protocol": self.combo_protocol.currentText(),
+                "host": self.entry_host.text(),
+                "port": self.entry_port.text(),
+                "username": self.entry_user.text(),
+                "password": self.entry_pass.text(),
+                "mqtt_topic": self.entry_topic.text(),
+                "amqp_vhost": self.entry_vhost.text(),
+                "amqp_queue": self.entry_queue.text(),
+                "amqp_exchange": self.entry_exchange.text(),
+                "amqp_routing": self.entry_routing.text()
+            }
+            self.profile_manager.save(name, data)
             self.refresh_profile_list()
-            self.combo_profiles.set(name)
+            self.combo_profiles.setCurrentText(name)
 
     def on_load_profile(self):
-        name = self.combo_profiles.get()
-        if not name:
-            return
-        if name in self.profile_manager.profiles:
-            settings = self.profile_manager.profiles[name]
-            self.apply_settings(settings)
+        name = self.combo_profiles.currentText()
+        if not name: return
+        data = self.profile_manager.profiles.get(name)
+        if data:
+            self.combo_protocol.setCurrentText(data.get("protocol", "MQTT"))
+            self.entry_host.setText(data.get("host", ""))
+            self.entry_port.setText(data.get("port", ""))
+            self.entry_user.setText(data.get("username", ""))
+            self.entry_pass.setText(data.get("password", ""))
+            self.entry_topic.setText(data.get("mqtt_topic", ""))
+            self.entry_vhost.setText(data.get("amqp_vhost", ""))
+            self.entry_queue.setText(data.get("amqp_queue", ""))
+            self.entry_exchange.setText(data.get("amqp_exchange", ""))
+            self.entry_routing.setText(data.get("amqp_routing", ""))
+            self._on_protocol_change(self.combo_protocol.currentText())
 
     def on_delete_profile(self):
-        name = self.combo_profiles.get()
-        if not name:
-            return
-        if messagebox.askyesno("Confirm", f"Delete property '{name}'?"):
-            self.profile_manager.delete(name)
-            self.refresh_profile_list()
+        name = self.combo_profiles.currentText()
+        if name:
+             self.profile_manager.delete(name)
+             self.refresh_profile_list()
 
 def main():
-    app = ttk.Window(themename="flatly")
-    App(app)
-    app.geometry("900x500")
-    app.mainloop()
+    app = QApplication(sys.argv)
+    window = MessageBoxApp()
+    window.show()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MessageBox
+GenericName=MQTT & AMQP Client
+Comment=Test MQTT and AMQP messaging
+Exec=messagebox
+Icon=messagebox
+Terminal=false
+Categories=Development;Network;
+Keywords=MQTT;AMQP;RabbitMQ;Test;
